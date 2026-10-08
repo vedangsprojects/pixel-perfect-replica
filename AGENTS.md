@@ -8,3 +8,4 @@
 > Commits you push to the connected branch sync back to Lovable and show up in
 > the editor, so keep the branch in a working state.
 <!-- LOVABLE:END -->
+- Arduino serial parsing/safety rules live in src/lib/blindway.ts (pure, tested); Web Serial I/O in src/hooks/useArduinoSerial.ts — keeps logic testable without hardware.
