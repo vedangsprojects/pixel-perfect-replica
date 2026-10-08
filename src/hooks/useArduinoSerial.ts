@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { parseLine, splitBuffer, type ArduinoEvent, type Light, type Status } from "@/lib/blindway";
+import { parseMessage, splitBuffer, type ArduinoEvent, type Light, type Status } from "@/lib/blindway";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type SerialPortLike = any;
@@ -54,22 +54,22 @@ export function useArduinoSerial(opts: {
       const next = [...m, { id: ++idRef.current, time: new Date().toLocaleTimeString(), text }];
       return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
     });
-    const p = parseLine(text);
-    if (!p) return;
-    if (p.kind === "LIGHT") {
-      const changed = snap.current.light !== p.value;
-      snap.current.light = p.value;
-      setLight(p.value);
-      if (changed) optsRef.current.onLight?.(p.value, { ...snap.current });
-    } else if (p.kind === "DISTANCE") {
-      snap.current.distance = p.value;
-      setDistance(p.value);
-    } else if (p.kind === "STATUS") {
-      snap.current.status = p.value;
-      setStatus(p.value);
-    } else {
-      setEvent(p.value);
-      optsRef.current.onEvent?.(p.value, { ...snap.current });
+    for (const p of parseMessage(text)) {
+      if (p.kind === "LIGHT") {
+        const changed = snap.current.light !== p.value;
+        snap.current.light = p.value;
+        setLight(p.value);
+        if (changed) optsRef.current.onLight?.(p.value, { ...snap.current });
+      } else if (p.kind === "DISTANCE") {
+        snap.current.distance = p.value;
+        setDistance(p.value);
+      } else if (p.kind === "STATUS") {
+        snap.current.status = p.value;
+        setStatus(p.value);
+      } else {
+        setEvent(p.value);
+        optsRef.current.onEvent?.(p.value, { ...snap.current });
+      }
     }
   }, []);
 
