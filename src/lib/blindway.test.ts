@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseLine, splitBuffer, deriveSafety } from "./blindway";
+import { parseLine, parseMessage, splitBuffer, deriveSafety } from "./blindway";
 
 describe("parser", () => {
   it("parses known messages", () => {
@@ -19,13 +19,40 @@ describe("parser", () => {
 });
 
 describe("safety", () => {
-  it("safe only when green and SAFE", () => {
-    expect(deriveSafety("GREEN", "SAFE")).toBe("SAFE");
-    expect(deriveSafety("GREEN", null)).toBe("UNKNOWN");
-  });
+  it("green alone is check road", () => expect(deriveSafety("GREEN", null)).toBe("CHECK"));
   it("green + danger is danger", () => expect(deriveSafety("GREEN", "DANGER")).toBe("DANGER"));
   it("red stop, yellow wait", () => {
     expect(deriveSafety("RED", "SAFE")).toBe("STOP");
     expect(deriveSafety("YELLOW", "SAFE")).toBe("WAIT");
+  });
+});
+
+function run(lines: string[]) {
+  let light: any = null, status: any = null;
+  for (const l of lines) for (const p of parseMessage(l)) {
+    if (p.kind === "LIGHT") light = p.value;
+    if (p.kind === "STATUS") status = p.value;
+  }
+  return { light, status, safety: deriveSafety(light, status) };
+}
+
+describe("simple text messages", () => {
+  it("> OK TO MOVE is safe + green", () => expect(run(["> OK TO MOVE"])).toEqual({ light: "GREEN", status: "SAFE", safety: "SAFE" }));
+  it("OK TO MOVE / STATUS:SAFE safe", () => {
+    expect(run(["ok to move"]).safety).toBe("SAFE");
+    expect(run(["STATUS:SAFE"]).safety).toBe("SAFE");
+  });
+  it("danger variants", () => {
+    for (const m of ["> DANGER", "VEHICLE DETECTED", "JUMPER DETECTED", "WARNING", "DANGER! VEHICLE TOO CLOSE", "STATUS:DANGER"])
+      expect(run(["OK TO MOVE", m]).safety).toBe("DANGER");
+  });
+  it("lights", () => {
+    expect(run(["LIGHT:RED"]).safety).toBe("STOP");
+    expect(run(["YELLOW"]).safety).toBe("WAIT");
+    expect(run(["LIGHT:GREEN"]).safety).toBe("CHECK");
+  });
+  it("distance formats", () => {
+    for (const m of ["DISTANCE:18", "Distance: 18 cm", "18 cm"])
+      expect(parseMessage(m)).toContainEqual({ kind: "DISTANCE", value: 18 });
   });
 });

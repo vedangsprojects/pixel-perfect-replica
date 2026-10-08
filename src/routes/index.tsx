@@ -135,7 +135,10 @@ function Index() {
           </p>
         )}
         {serial.lastMessage && (
-          <p className="w-full font-mono text-xs text-muted-foreground">Latest raw message: &gt; {serial.lastMessage}</p>
+          <div className="w-full font-mono text-xs text-muted-foreground">
+            <p>Latest raw message: &gt; {serial.lastMessage}</p>
+            <p className="mt-1 text-primary">PARSED STATUS: {serial.status ?? "—"} · PARSED LIGHT: {serial.light ?? "—"}</p>
+          </div>
         )}
       </section>
 
@@ -244,9 +247,10 @@ function TrafficLight({ light }: { light: Light | null }) {
 function SafetyCard({ safety }: { safety: ReturnType<typeof deriveSafety> }) {
   const view = {
     SAFE: { cls: "border-sig-green bg-sig-green/15", title: "🟢 SAFE TO CROSS", sub: ["It's OK to move"] },
-    DANGER: { cls: "border-destructive bg-destructive/25 danger-pulse", title: "🚨 DANGER", sub: ["VEHICLE DETECTED", "DO NOT CROSS"] },
-    STOP: { cls: "border-sig-red bg-sig-red/10", title: "🔴 STOP", sub: ["Wait for green"] },
-    WAIT: { cls: "border-sig-yellow bg-sig-yellow/10", title: "🟡 WAIT", sub: ["Light is changing"] },
+    DANGER: { cls: "border-destructive bg-destructive/25 danger-pulse", title: "🚨 DANGER", sub: ["DO NOT CROSS", "Vehicle detected"] },
+    STOP: { cls: "border-sig-red bg-sig-red/10", title: "🔴 STOP", sub: ["Do not cross"] },
+    WAIT: { cls: "border-sig-yellow bg-sig-yellow/10", title: "🟡 WAIT", sub: ["Wait for the green signal."] },
+    CHECK: { cls: "border-sig-green bg-sig-green/10", title: "🟢 GREEN", sub: ["CHECK ROAD"] },
     UNKNOWN: { cls: "border-border bg-card", title: "— NO DATA —", sub: ["Connect the Arduino to begin"] },
   }[safety];
   return (
