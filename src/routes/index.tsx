@@ -81,7 +81,7 @@ function Index() {
     if (!demo) return;
     let i = 0;
     const t = setInterval(() => {
-      DEMO_STREAM[i % DEMO_STREAM.length].forEach(serial.ingest);
+      (DEMO_STREAM[i % DEMO_STREAM.length] ?? []).forEach(serial.ingest);
       i++;
     }, 2500);
     return () => clearInterval(t);
