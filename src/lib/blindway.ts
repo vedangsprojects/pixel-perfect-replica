@@ -50,6 +50,7 @@ export function parseMessage(raw: string): ParsedLine[] {
   if (idx > 0) {
     const r = parseStructured(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
     if (r) return r;
+    if (line.startsWith("TIMING_")) return []; // malformed ack/error: never read as a light
   }
   const out: ParsedLine[] = [];
   const dist = line.match(/(?:DISTANCE\s*:?\s*)?(\d+(?:\.\d+)?)\s*CM\b/) ?? line.match(/^DISTANCE\s*:?\s*(\d+(?:\.\d+)?)$/);
