@@ -1,18 +1,19 @@
 /*
-  BLINDWAY — Smart Road Crossing
+  BLINDWAY - Smart Road Crossing
 
-  RED = pedestrians may cross if road is clear
-  YELLOW = WAIT
-  GREEN = vehicles go; pedestrians WAIT
+  GREEN  = Vehicles go; buzzer OFF
+  YELLOW = WAIT; buzzer OFF
+  RED    = Buzzer sounds only when road status permits,
+           or pulses when danger is detected.
 
-  Red LED: D8
-  Yellow LED: D9
-  Green LED: D10
-  Buzzer: D11
+  Red LED:      D8
+  Yellow LED:   D9
+  Green LED:    D10
+  Buzzer:       D11
   Ultrasonic TRIG: D13
   Ultrasonic ECHO: A0
 
-  Serial baud rate: 9600
+  Serial: 9600 baud
 */
 
 const int RED_PIN = 8;
@@ -27,6 +28,7 @@ const int DANGER_CM = 10;
 const unsigned long BEEP_MS = 1000;
 const unsigned long SENSOR_MS = 100;
 const unsigned long REPORT_MS = 500;
+const unsigned long DANGER_TOGGLE_MS = 150;
 
 enum Phase { P_RED, P_YELLOW, P_GREEN };
 enum Safe { S_SAFE, S_DANGER, S_UNKNOWN };
@@ -53,9 +55,11 @@ long distanceCm = -1;
 
 bool crossingNotified = false;
 bool crossingBeepActive = false;
-bool dangerToneActive = false;
+bool dangerToneOn = false;
 
 String inBuf;
+
+// ---------------- SENSOR ----------------
 
 long readDistance() {
   digitalWrite(TRIG_PIN, LOW);
@@ -76,12 +80,76 @@ long readDistance() {
   return cm;
 }
 
+// ---------------- BUZZER ----------------
+
 void stopBuzzer() {
   crossingBeepActive = false;
-  dangerToneActive = false;
+  dangerToneOn = false;
   noTone(BUZZER_PIN);
   digitalWrite(BUZZER_PIN, LOW);
 }
+
+void updateBuzzer(unsigned long now) {
+  // Absolute rule: NO buzzer during GREEN or YELLOW.
+  if (phase != P_RED) {
+    stopBuzzer();
+    return;
+  }
+
+  // Unknown distance is not treated as safe.
+  if (safety == S_UNKNOWN) {
+    stopBuzzer();
+    return;
+  }
+
+  // Danger warning: pulses only during RED.
+  if (safety == S_DANGER) {
+    crossingBeepActive = false;
+
+    if (now - lastToggle >= DANGER_TOGGLE_MS) {
+      lastToggle = now;
+      dangerToneOn = !dangerToneOn;
+
+      if (dangerToneOn) {
+        tone(BUZZER_PIN, 3000);
+        Serial.println("BUZZER:DANGER_ON");
+      } else {
+        noTone(BUZZER_PIN);
+        digitalWrite(BUZZER_PIN, LOW);
+        Serial.println("BUZZER:DANGER_OFF");
+      }
+    }
+    return;
+  }
+
+  // If danger has cleared, stop the danger tone first.
+  if (dangerToneOn) {
+    dangerToneOn = false;
+    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // Normal crossing notification: RED + SAFE only.
+  if (!crossingNotified) {
+    crossingNotified = true;
+    crossingBeepActive = true;
+    beepStart = now;
+
+    tone(BUZZER_PIN, 2000);
+    Serial.println("EVENT:RED_SAFE");
+    Serial.println("BUZZER:CROSSING_ON");
+  }
+
+  // Stop normal notification after one second.
+  if (crossingBeepActive && now - beepStart >= BEEP_MS) {
+    crossingBeepActive = false;
+    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("BUZZER:CROSSING_OFF");
+  }
+}
+
+// ---------------- TRAFFIC LIGHTS ----------------
 
 void setLeds() {
   digitalWrite(RED_PIN, phase == P_RED);
@@ -109,8 +177,7 @@ void enterPhase(Phase p) {
 
   phase = p;
   phaseStart = millis();
-  phaseLength = durationMs[phase];
-
+  phaseLength = durationMs[(int)phase];
   crossingNotified = false;
 
   setLeds();
@@ -118,22 +185,14 @@ void enterPhase(Phase p) {
   Serial.print("LIGHT:");
   Serial.println(PHASE_NAME[phase]);
 
-  // Only announce a crossing when RED begins and
-  // the sensor has already confirmed the road is clear.
-  if (phase == P_RED &&
-      safety == S_SAFE &&
-      !crossingNotified) {
-
-    crossingNotified = true;
-    crossingBeepActive = true;
-    beepStart = millis();
-
-    tone(BUZZER_PIN, 2000);
-    Serial.println("EVENT:RED_SAFE");
+  if (phase == P_GREEN || phase == P_YELLOW) {
+    Serial.println("BUZZER:FORCED_OFF");
   }
 
   report();
 }
+
+// ---------------- WEBSITE TIMING COMMANDS ----------------
 
 void handleCommand(String c) {
   c.trim();
@@ -196,6 +255,8 @@ void readSerial() {
   }
 }
 
+// ---------------- SETUP ----------------
+
 void setup() {
   pinMode(RED_PIN, OUTPUT);
   pinMode(YELLOW_PIN, OUTPUT);
@@ -204,7 +265,8 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(TRIG_PIN, LOW);
+  stopBuzzer();
 
   Serial.begin(9600);
   inBuf.reserve(40);
@@ -212,12 +274,14 @@ void setup() {
   enterPhase(P_GREEN);
 }
 
+// ---------------- MAIN LOOP ----------------
+
 void loop() {
   unsigned long now = millis();
 
   readSerial();
 
-  // Read ultrasonic sensor
+  // Read ultrasonic distance.
   if (now - lastSensor >= SENSOR_MS) {
     lastSensor = now;
 
@@ -236,10 +300,8 @@ void loop() {
 
       if (safety == S_DANGER) {
         Serial.println("EVENT:VEHICLE_DETECTED");
-
-        // Cancel the normal crossing beep immediately.
-        stopBuzzer();
         crossingNotified = false;
+        stopBuzzer();
       }
 
       if (safety == S_UNKNOWN) {
@@ -248,7 +310,7 @@ void loop() {
     }
   }
 
-  // Change traffic-light phase
+  // Traffic-light sequence: GREEN -> YELLOW -> RED -> GREEN.
   if (now - phaseStart >= phaseLength) {
     Phase nextPhase =
       phase == P_GREEN ? P_YELLOW :
@@ -256,53 +318,13 @@ void loop() {
       P_GREEN;
 
     enterPhase(nextPhase);
+    now = millis();
   }
 
-  // NORMAL CROSSING BEEP:
-  // RED + SAFE only. Never beep normally on GREEN or YELLOW.
-  if (phase == P_RED &&
-      safety == S_SAFE &&
-      !crossingNotified) {
+  // The ONLY function that manages buzzer behavior.
+  updateBuzzer(now);
 
-    crossingNotified = true;
-    crossingBeepActive = true;
-    beepStart = millis();
-
-    tone(BUZZER_PIN, 2000);
-    Serial.println("EVENT:RED_SAFE");
-  }
-
-  // Stop the normal beep after one second.
-  if (crossingBeepActive) {
-    if (phase != P_RED || safety != S_SAFE) {
-      stopBuzzer();
-    } else if (millis() - beepStart >= BEEP_MS) {
-      stopBuzzer();
-    }
-  }
-
-  // DANGER warning: fast pulses only during RED.
-  if (phase == P_RED && safety == S_DANGER) {
-    if (millis() - lastToggle >= 150) {
-      lastToggle = millis();
-      dangerToneActive = !dangerToneActive;
-
-      if (dangerToneActive) {
-        tone(BUZZER_PIN, 3000);
-      } else {
-        noTone(BUZZER_PIN);
-      }
-    }
-  } else if (dangerToneActive) {
-    stopBuzzer();
-  }
-
-  // Force buzzer OFF during GREEN and YELLOW
-  if (phase != P_RED) {
-    stopBuzzer();
-  }
-
-  // Report current state to the website
+  // Send live status to the website.
   if (millis() - lastReport >= REPORT_MS) {
     lastReport = millis();
     report();
