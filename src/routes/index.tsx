@@ -1,7 +1,22 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useArduinoSerial, isWebSerialSupported, type ReadingSnapshot } from "@/hooks/useArduinoSerial";
-import { deriveSafety, VOICE, type ArduinoEvent, type Light } from "@/lib/blindway";
+import { useArduinoSerial, isWebSerialSupported } from "@/hooks/useArduinoSerial";
+import {
+  announcementFor,
+  deriveSafety,
+  hardwareStatus,
+  isStale,
+  loadTimings,
+  saveTimings,
+  timingCommands,
+  validateSeconds,
+  DEFAULT_TIMINGS,
+  LIGHTS,
+  VOICE,
+  type Light,
+  type Safety,
+  type Timings,
+} from "@/lib/blindway";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -27,54 +42,78 @@ interface HistoryItem {
 }
 
 const DEMO_STREAM = [
-  ["LIGHT:RED", "STATUS:SAFE", "DISTANCE:25"],
-  ["LIGHT:YELLOW", "STATUS:SAFE", "DISTANCE:20"],
-  ["LIGHT:GREEN", "DISTANCE:18", "STATUS:SAFE", "EVENT:GREEN_SAFE"],
-  ["LIGHT:GREEN", "DISTANCE:5", "STATUS:DANGER", "EVENT:VEHICLE_DETECTED"],
-  ["LIGHT:GREEN", "DISTANCE:19", "STATUS:SAFE", "EVENT:GREEN_SAFE"],
+  ["LIGHT:GREEN", "STATUS:DANGER", "DISTANCE:6"],
+  ["LIGHT:YELLOW", "STATUS:SAFE", "DISTANCE:22"],
+  ["LIGHT:RED", "DISTANCE:24", "STATUS:SAFE", "EVENT:RED_SAFE"],
+  ["LIGHT:RED", "DISTANCE:23", "STATUS:SAFE"],
+  ["LIGHT:RED", "DISTANCE:5", "STATUS:DANGER", "EVENT:VEHICLE_DETECTED"],
 ];
+
+const HISTORY_LABEL: Record<Safety, [string, string]> = {
+  SAFE: ["🟢", "Red light - Road clear - OK to cross"],
+  DANGER: ["🚨", "Vehicle detected - Do not cross"],
+  WAIT: ["🟡", "Yellow light - Wait"],
+  GREEN_WAIT: ["🛑", "Green light - Vehicles have the signal"],
+  UNKNOWN: ["⚠️", "Road status unknown - Do not cross"],
+};
 
 function Index() {
   const [muted, setMuted] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [demo, setDemo] = useState(false);
   const [supported, setSupported] = useState(true);
   const [monitorOpen, setMonitorOpen] = useState(true);
-  const lastSpoken = useRef<ArduinoEvent | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [timings, setTimings] = useState<Timings>(DEFAULT_TIMINGS);
+  const [acked, setAcked] = useState<Partial<Timings>>({});
+  const [sentAt, setSentAt] = useState<number | null>(null);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
+  const timingsRef = useRef(timings);
+  timingsRef.current = timings;
   const hid = useRef(0);
+  const prevSafety = useRef<Safety | null>(null);
 
-  useEffect(() => setSupported(isWebSerialSupported()), []);
+  useEffect(() => {
+    setSupported(isWebSerialSupported());
+    setTimings(loadTimings(window.localStorage));
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, []);
 
   const speak = useCallback((text: string, force = false) => {
-    if ((mutedRef.current && !force) || typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel(); // never overlap; newest (state-change) message wins
+    if (mutedRef.current && !force) return;
     const u = new SpeechSynthesisUtterance(text);
     u.rate = 0.95;
+    u.onstart = () => setSpeaking(true);
+    u.onend = u.onerror = () => setSpeaking(false);
     window.speechSynthesis.speak(u);
   }, []);
 
-  const addHistory = useCallback((icon: string, label: string, s: ReadingSnapshot) => {
-    setHistory((h) =>
-      [{ id: ++hid.current, time: new Date().toLocaleTimeString(), icon, label, distance: s.distance, light: s.light }, ...h].slice(0, 50),
-    );
-  }, []);
-
   const serial = useArduinoSerial({
-    onEvent: (e, s) => {
-      if (lastSpoken.current === e) return; // only announce when the event changes
-      lastSpoken.current = e;
-      speak(VOICE[e]);
-      if (e === "GREEN_SAFE") addHistory("🟢", "Green light - Road clear", s);
-      else addHistory("🚨", "Vehicle detected", s);
-    },
-    onLight: (l, s) => {
-      if (l !== "GREEN") lastSpoken.current = null;
-      if (l === "RED") addHistory("🔴", "Red light - Stop", s);
-      if (l === "YELLOW") addHistory("🟡", "Yellow light - Wait", s);
-    },
+    onTimingAck: (phase, seconds) => setAcked((a) => ({ ...a, [phase]: seconds })),
   });
+
+  const stale = isStale(serial.lastDataAt, now);
+  const safety = deriveSafety(serial.light, serial.status, stale);
+
+  // Event-based voice + history: runs only when the derived safety state changes.
+  useEffect(() => {
+    const prev = prevSafety.current;
+    prevSafety.current = safety;
+    if (prev === safety) return;
+    const a = announcementFor(prev, safety);
+    if (a) speak(VOICE[a]);
+    else if (prev === "SAFE" && typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+    if (prev === null && safety === "UNKNOWN") return;
+    const [icon, label] = HISTORY_LABEL[safety];
+    setHistory((h) =>
+      [{ id: ++hid.current, time: new Date().toLocaleTimeString(), icon, label, distance: serial.distance, light: serial.light }, ...h].slice(0, 50),
+    );
+  }, [safety, speak, serial.distance, serial.light]);
 
   // Demo mode: clearly labelled, off by default
   useEffect(() => {
@@ -87,11 +126,36 @@ function Index() {
     return () => clearInterval(t);
   }, [demo, serial.ingest]);
 
-  const safety = deriveSafety(serial.light, serial.status);
+  const pushTimings = useCallback(
+    async (t: Timings) => {
+      setAcked({});
+      setSentAt(null);
+      if (await serial.send(timingCommands(t))) setSentAt(Date.now());
+    },
+    [serial.send],
+  );
+
+  // Arduino resets when the port opens: send saved timings once it has booted.
+  useEffect(() => {
+    if (!serial.isConnected) {
+      setAcked({});
+      setSentAt(null);
+      return;
+    }
+    const t = setTimeout(() => void pushTimings(timingsRef.current), 2000);
+    return () => clearTimeout(t);
+  }, [serial.isConnected, pushTimings]);
+
+  const saveAndApply = (t: Timings) => {
+    setTimings(t);
+    saveTimings(window.localStorage, t);
+    if (serial.isConnected) void pushTimings(t);
+  };
+
+  const voiceState = muted ? "MUTED" : speaking ? "SPEAKING" : "VOICE READY";
 
   return (
     <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
-      {/* Header */}
       <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-5xl font-bold tracking-[0.2em] text-primary">BLINDWAY</h1>
@@ -103,7 +167,6 @@ function Index() {
         </label>
       </header>
 
-      {/* Connection */}
       <section className="panel flex flex-wrap items-center gap-6" aria-label="Arduino connection">
         <Stat label="Arduino Connection">
           <span className={serial.isConnected ? "text-sig-green" : "text-destructive"}>
@@ -112,6 +175,16 @@ function Index() {
         </Stat>
         <Stat label="COM Port">{serial.isConnected ? serial.portLabel : "—"}</Stat>
         <Stat label="Baud Rate">{serial.baudRate}</Stat>
+        <Stat label="Last valid data">
+          {serial.lastDataAt ? (
+            <span className={stale ? "text-sig-yellow" : ""}>
+              {new Date(serial.lastDataAt).toLocaleTimeString()}
+              {stale && " (stale)"}
+            </span>
+          ) : (
+            "—"
+          )}
+        </Stat>
         <div className="ml-auto flex flex-wrap gap-3">
           <button
             onClick={serial.connect}
@@ -143,13 +216,21 @@ function Index() {
       </section>
 
       <div className="grid gap-5 lg:grid-cols-[260px_1fr_300px]">
-        <TrafficLight light={serial.light} />
-        <SafetyCard safety={safety} />
+        <TrafficLight light={stale ? null : serial.light} />
+        <SafetyCard safety={safety} hasData={serial.lastDataAt != null} />
         <div className="space-y-5">
-          <DistanceCard distance={serial.distance} />
+          <DistanceCard distance={stale ? null : serial.distance} />
           <section className="panel space-y-3" aria-label="Voice controls">
-            <h2 className="font-mono text-xs tracking-widest text-muted-foreground">VOICE</h2>
-            <button onClick={() => speak("BLINDWAY voice test. It's OK to move.", true)} className="w-full rounded-lg bg-secondary px-4 py-3 font-semibold hover:bg-accent">
+            <div className="flex items-center justify-between">
+              <h2 className="font-mono text-xs tracking-widest text-muted-foreground">VOICE</h2>
+              <span
+                aria-live="polite"
+                className={`rounded border px-2 py-0.5 font-mono text-xs ${muted ? "text-destructive" : speaking ? "text-sig-green" : "text-primary"}`}
+              >
+                {voiceState}
+              </span>
+            </div>
+            <button onClick={() => speak("BLINDWAY voice test.", true)} className="w-full rounded-lg bg-secondary px-4 py-3 font-semibold hover:bg-accent">
               🔊 TEST VOICE
             </button>
             <button onClick={() => setMuted((m) => !m)} className="w-full rounded-lg border px-4 py-3 font-semibold hover:bg-accent" aria-pressed={muted}>
@@ -206,8 +287,20 @@ function Index() {
             </li>
           ))}
         </ol>
-        <p className="mt-3 text-xs text-muted-foreground">Close the Arduino IDE Serial Monitor first — only one program can use the port at a time. All data stays in your browser.</p>
+        <p className="mt-3 text-xs text-muted-foreground">
+          Close the Arduino IDE Serial Monitor first — only one program can use the port at a time. All data stays in your browser. School
+          prototype only — not a certified pedestrian safety system.
+        </p>
       </section>
+
+      <TimingSettings
+        timings={timings}
+        onSave={saveAndApply}
+        connected={serial.isConnected}
+        acked={acked}
+        sentAt={sentAt}
+        now={now}
+      />
     </main>
   );
 }
@@ -221,21 +314,22 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
+const LAMP_CLS: Record<Light, string> = {
+  RED: "bg-sig-red text-sig-red",
+  YELLOW: "bg-sig-yellow text-sig-yellow",
+  GREEN: "bg-sig-green text-sig-green",
+};
+
 function TrafficLight({ light }: { light: Light | null }) {
-  const lamps: { l: Light; cls: string }[] = [
-    { l: "RED", cls: "bg-sig-red text-sig-red" },
-    { l: "YELLOW", cls: "bg-sig-yellow text-sig-yellow" },
-    { l: "GREEN", cls: "bg-sig-green text-sig-green" },
-  ];
-  const caption = { RED: "🔴 RED — STOP", YELLOW: "🟡 YELLOW — WAIT", GREEN: "🟢 GREEN — CHECK ROAD" };
+  const caption = { RED: "🔴 RED — VEHICLES STOP", YELLOW: "🟡 YELLOW — WAIT", GREEN: "🟢 GREEN — PEDESTRIANS WAIT" };
   return (
     <section className="panel flex flex-col items-center gap-4" aria-label="Traffic light">
       <div className="flex flex-col gap-4 rounded-3xl border-4 bg-panel p-5">
-        {lamps.map(({ l, cls }) => (
+        {LIGHTS.map((l) => (
           <div
             key={l}
             aria-label={`${l} lamp ${light === l ? "on" : "off"}`}
-            className={`h-20 w-20 rounded-full transition-all duration-300 ${cls} ${light === l ? "lamp-glow opacity-100" : "opacity-15"}`}
+            className={`h-20 w-20 rounded-full transition-all duration-300 ${LAMP_CLS[l]} ${light === l ? "lamp-glow opacity-100" : "opacity-15"}`}
           />
         ))}
       </div>
@@ -244,14 +338,15 @@ function TrafficLight({ light }: { light: Light | null }) {
   );
 }
 
-function SafetyCard({ safety }: { safety: ReturnType<typeof deriveSafety> }) {
+function SafetyCard({ safety, hasData }: { safety: Safety; hasData: boolean }) {
   const view = {
-    SAFE: { cls: "border-sig-green bg-sig-green/15", title: "🟢 SAFE TO CROSS", sub: ["It's OK to move"] },
+    SAFE: { cls: "border-sig-green bg-sig-green/15", title: "🟢 OK TO CROSS", sub: ["Signal red · Road clear"] },
     DANGER: { cls: "border-destructive bg-destructive/25 danger-pulse", title: "🚨 DANGER", sub: ["DO NOT CROSS", "Vehicle detected"] },
-    STOP: { cls: "border-sig-red bg-sig-red/10", title: "🔴 STOP", sub: ["Do not cross"] },
-    WAIT: { cls: "border-sig-yellow bg-sig-yellow/10", title: "🟡 WAIT", sub: ["Wait for the green signal."] },
-    CHECK: { cls: "border-sig-green bg-sig-green/10", title: "🟢 GREEN", sub: ["CHECK ROAD"] },
-    UNKNOWN: { cls: "border-border bg-card", title: "— NO DATA —", sub: ["Connect the Arduino to begin"] },
+    WAIT: { cls: "border-sig-yellow bg-sig-yellow/10", title: "🟡 WAIT", sub: ["Signal is changing"] },
+    GREEN_WAIT: { cls: "border-sig-red bg-sig-red/10", title: "🛑 WAIT", sub: ["Vehicles have the signal"] },
+    UNKNOWN: hasData
+      ? { cls: "border-sig-yellow bg-card", title: "⚠️ ROAD STATUS UNKNOWN", sub: ["DO NOT CROSS"] }
+      : { cls: "border-border bg-card", title: "— NO DATA —", sub: ["Connect the Arduino to begin"] },
   }[safety];
   return (
     <section
@@ -296,5 +391,145 @@ function SerialMonitor({ lines }: { lines: { id: number; time: string; text: str
         </div>
       ))}
     </div>
+  );
+}
+
+function TimingSettings(props: {
+  timings: Timings;
+  onSave: (t: Timings) => void;
+  connected: boolean;
+  acked: Partial<Timings>;
+  sentAt: number | null;
+  now: number;
+}) {
+  const { timings, onSave, connected, acked, sentAt, now } = props;
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [draft, setDraft] = useState<Record<Light, string>>({ RED: "", YELLOW: "", GREEN: "" });
+  const [errors, setErrors] = useState<Partial<Record<Light, string>>>({});
+  const [saved, setSaved] = useState(false);
+
+  const open = () => {
+    setDraft({ RED: String(timings.RED), YELLOW: String(timings.YELLOW), GREEN: String(timings.GREEN) });
+    setErrors({});
+    dialogRef.current?.showModal();
+  };
+  const close = () => dialogRef.current?.close();
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const next = { ...timings };
+    const errs: Partial<Record<Light, string>> = {};
+    for (const l of LIGHTS) {
+      const r = validateSeconds(draft[l]);
+      if (r.ok) next[l] = r.value;
+      else errs[l] = r.error;
+    }
+    setErrors(errs);
+    if (Object.keys(errs).length) return;
+    onSave(next);
+    setSaved(true);
+    close();
+  };
+
+  const hwText = {
+    APPLIED: ["✓ Applied on Arduino", "text-sig-green"],
+    PENDING: ["Waiting for Arduino confirmation…", "text-sig-yellow"],
+    NO_ACK: ["No confirmation — is the updated firmware uploaded?", "text-destructive"],
+    LOCAL: ["Saved locally — connect Arduino to apply.", "text-muted-foreground"],
+  } as const;
+
+  return (
+    <section className="panel space-y-4" aria-label="Traffic light timing settings">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="font-mono text-xs tracking-widest text-muted-foreground">TRAFFIC LIGHT TIMING SETTINGS</h2>
+          <p className="mt-1 text-sm">Customize how long each traffic-light phase lasts.</p>
+        </div>
+        <button onClick={open} className="rounded-lg bg-primary px-6 py-3 text-lg font-bold tracking-wide text-primary-foreground hover:opacity-90">
+          ⚙ CHANGE TIMING
+        </button>
+      </div>
+
+      {saved && (
+        <p role="status" className="text-sm text-sig-green">
+          Timing settings saved.
+        </p>
+      )}
+      <ul className="grid gap-3 sm:grid-cols-3">
+        {LIGHTS.map((l) => {
+          const [txt, cls] = hwText[hardwareStatus(timings[l], acked[l], connected, sentAt, now)];
+          return (
+            <li key={l} className="flex items-center gap-3 rounded-lg bg-panel p-3">
+              <span className={`h-5 w-5 shrink-0 rounded-full ${LAMP_CLS[l]}`} aria-hidden />
+              <div>
+                <div className="font-semibold">
+                  {l}: {timings[l]} seconds
+                </div>
+                <div className={`text-xs ${cls}`}>{txt}</div>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+
+      <dialog
+        ref={dialogRef}
+        aria-labelledby="timing-title"
+        className="m-auto w-[min(92vw,28rem)] rounded-2xl border-2 bg-card p-6 text-foreground backdrop:bg-background/80"
+      >
+        <form onSubmit={submit} noValidate className="space-y-4">
+          <h3 id="timing-title" className="font-mono text-sm tracking-widest text-primary">
+            TRAFFIC LIGHT TIMING
+          </h3>
+          {LIGHTS.map((l) => (
+            <div key={l}>
+              <label htmlFor={`t-${l}`} className="flex items-center gap-2 font-semibold">
+                <span className={`h-4 w-4 rounded-full ${LAMP_CLS[l]}`} aria-hidden />
+                {l} duration
+              </label>
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  id={`t-${l}`}
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={60}
+                  step={1}
+                  value={draft[l]}
+                  onChange={(e) => setDraft((d) => ({ ...d, [l]: e.target.value }))}
+                  aria-invalid={!!errors[l]}
+                  aria-describedby={errors[l] ? `e-${l}` : undefined}
+                  className="w-24 rounded-lg border bg-panel px-3 py-2 font-mono text-lg"
+                />
+                <span className="text-sm text-muted-foreground">seconds (1–60)</span>
+              </div>
+              {errors[l] && (
+                <p id={`e-${l}`} role="alert" className="mt-1 text-sm text-destructive">
+                  {errors[l]}
+                </p>
+              )}
+            </div>
+          ))}
+          <div className="flex flex-wrap gap-2 pt-2">
+            <button type="submit" className="rounded-lg bg-primary px-4 py-2 font-bold text-primary-foreground hover:opacity-90">
+              SAVE TIMINGS
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setDraft({ RED: String(DEFAULT_TIMINGS.RED), YELLOW: String(DEFAULT_TIMINGS.YELLOW), GREEN: String(DEFAULT_TIMINGS.GREEN) });
+                setErrors({});
+              }}
+              className="rounded-lg border px-4 py-2 font-semibold hover:bg-accent"
+            >
+              RESET DEFAULTS
+            </button>
+            <button type="button" onClick={close} className="rounded-lg border px-4 py-2 font-semibold hover:bg-accent">
+              CANCEL
+            </button>
+          </div>
+        </form>
+      </dialog>
+    </section>
   );
 }

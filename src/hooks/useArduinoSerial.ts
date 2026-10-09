@@ -26,7 +26,10 @@ export function isWebSerialSupported() {
 export function useArduinoSerial(opts: {
   onEvent?: (e: ArduinoEvent, snap: ReadingSnapshot) => void;
   onLight?: (l: Light, snap: ReadingSnapshot) => void;
+  onTimingAck?: (phase: Light, seconds: number) => void;
 } = {}) {
+  const [lastDataAt, setLastDataAt] = useState<number | null>(null);
+  const writeChain = useRef<Promise<unknown>>(Promise.resolve());
   const [isConnected, setConnected] = useState(false);
   const [port, setPort] = useState<SerialPortLike | null>(null);
   const [portLabel, setPortLabel] = useState<string | null>(null);
@@ -55,6 +58,11 @@ export function useArduinoSerial(opts: {
       return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
     });
     for (const p of parseMessage(text)) {
+      if (p.kind === "TIMING_ACK") {
+        optsRef.current.onTimingAck?.(p.phase, p.seconds);
+        continue;
+      }
+      if (p.kind !== "EVENT") setLastDataAt(Date.now());
       if (p.kind === "LIGHT") {
         const changed = snap.current.light !== p.value;
         snap.current.light = p.value;
@@ -152,6 +160,27 @@ export function useArduinoSerial(opts: {
     void readLoop(p);
   }, [cleanup, readLoop]);
 
+  /** Write newline-terminated lines over the existing port (serialised). */
+  const send = useCallback((lines: string[]): Promise<boolean> => {
+    const job = writeChain.current.then(async () => {
+      const p = portRef.current;
+      if (!p?.writable) return false;
+      const w = p.writable.getWriter();
+      try {
+        const enc = new TextEncoder();
+        for (const l of lines) await w.write(enc.encode(l + "\n"));
+        return true;
+      } catch {
+        setError("Could not send data to the Arduino.");
+        return false;
+      } finally {
+        w.releaseLock();
+      }
+    });
+    writeChain.current = job.catch(() => {});
+    return job;
+  }, []);
+
   const disconnect = useCallback(async () => {
     await cleanup();
     setError(null);
@@ -180,12 +209,15 @@ export function useArduinoSerial(opts: {
     setStatus(null);
     setEvent(null);
     setLastMessage(null);
+    setLastDataAt(null);
   }, []);
 
   return {
     connect,
     disconnect,
     ingest,
+    send,
+    lastDataAt,
     reset,
     clearMessages: () => setMessages([]),
     isConnected,
