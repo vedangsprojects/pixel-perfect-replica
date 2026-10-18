@@ -165,3 +165,33 @@ export function hardwareStatus(
   if (sentAt != null && now - sentAt > ACK_TIMEOUT_MS) return "NO_ACK";
   return "PENDING";
 }
+
+/* ---------- Light-change announcements ---------- */
+
+export type LightAnnouncement = "RED" | "RED_TO_YELLOW";
+export const LIGHT_VOICE: Record<LightAnnouncement, string> = {
+  RED: "Red light. Please wait.",
+  RED_TO_YELLOW: "Attention. The signal is changing. Please continue waiting.",
+};
+
+/**
+ * Announce only genuine transitions between two known lights. `prev` is null
+ * after page load, (re)connect or stale data, so those never trigger speech.
+ */
+export function lightAnnouncementFor(prev: Light | null, next: Light | null): LightAnnouncement | null {
+  if (prev == null || next == null || prev === next) return null;
+  if (prev === "RED" && next === "YELLOW") return "RED_TO_YELLOW";
+  if (next === "RED") return "RED";
+  return null;
+}
+
+/** Pick a voice: saved choice, then en-IN, then any English, then first. */
+export function pickVoice<V extends { name: string; lang: string }>(voices: V[], savedName: string | null): V | null {
+  return (
+    voices.find((v) => v.name === savedName) ??
+    voices.find((v) => v.lang.replace("_", "-").toLowerCase() === "en-in") ??
+    voices.find((v) => v.lang.toLowerCase().startsWith("en")) ??
+    voices[0] ??
+    null
+  );
+}

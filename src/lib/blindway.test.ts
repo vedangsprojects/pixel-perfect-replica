@@ -105,3 +105,18 @@ describe("timing", () => {
     expect(hardwareStatus(5, 5, false, 0, 100)).toBe("LOCAL");
   });
 });
+
+import { lightAnnouncementFor, pickVoice } from "./blindway";
+describe("light announcements", () => {
+  it("RED -> YELLOW announces the transition", () => expect(lightAnnouncementFor("RED", "YELLOW")).toBe("RED_TO_YELLOW"));
+  it("repeated YELLOW is silent", () => expect(lightAnnouncementFor("YELLOW", "YELLOW")).toBeNull());
+  it("first light after load/reconnect is silent", () => expect(lightAnnouncementFor(null, "YELLOW")).toBeNull());
+  it("YELLOW -> GREEN is silent", () => expect(lightAnnouncementFor("YELLOW", "GREEN")).toBeNull());
+  it("GREEN -> RED announces red", () => expect(lightAnnouncementFor("GREEN", "RED")).toBe("RED"));
+  it("prefers en-IN then English", () => {
+    const v = [{ name: "a", lang: "fr-FR" }, { name: "b", lang: "en-US" }, { name: "c", lang: "en-IN" }];
+    expect(pickVoice(v, null)?.name).toBe("c");
+    expect(pickVoice(v, "b")?.name).toBe("b");
+    expect(pickVoice(v.slice(0, 2), null)?.name).toBe("b");
+  });
+});
