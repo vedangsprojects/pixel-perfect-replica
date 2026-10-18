@@ -3,6 +3,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useArduinoSerial, isWebSerialSupported } from "@/hooks/useArduinoSerial";
 import {
   announcementFor,
+  lightAnnouncementFor,
+  pickVoice,
+  LIGHT_VOICE,
   deriveSafety,
   hardwareStatus,
   isStale,
@@ -41,13 +44,15 @@ interface HistoryItem {
   light: Light | null;
 }
 
+// Same sequence as the Arduino: RED -> YELLOW -> GREEN -> RED
 const DEMO_STREAM = [
-  ["LIGHT:GREEN", "STATUS:DANGER", "DISTANCE:6"],
-  ["LIGHT:YELLOW", "STATUS:SAFE", "DISTANCE:22"],
   ["LIGHT:RED", "DISTANCE:24", "STATUS:SAFE", "EVENT:RED_SAFE"],
-  ["LIGHT:RED", "DISTANCE:23", "STATUS:SAFE"],
   ["LIGHT:RED", "DISTANCE:5", "STATUS:DANGER", "EVENT:VEHICLE_DETECTED"],
+  ["LIGHT:YELLOW", "STATUS:SAFE", "DISTANCE:22"],
+  ["LIGHT:YELLOW", "STATUS:SAFE", "DISTANCE:21"],
+  ["LIGHT:GREEN", "STATUS:SAFE", "DISTANCE:30"],
 ];
+const VOICE_KEY = "blindway.voice";
 
 const HISTORY_LABEL: Record<Safety, [string, string]> = {
   SAFE: ["🟢", "Red light - Road clear - OK to cross"],
@@ -74,6 +79,21 @@ function Index() {
   timingsRef.current = timings;
   const hid = useRef(0);
   const prevSafety = useRef<Safety | null>(null);
+  const prevLight = useRef<Light | null>(null);
+  const dangerSpeaking = useRef(false);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voiceName, setVoiceName] = useState<string | null>(null);
+  const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  voiceRef.current = pickVoice(voices, voiceName);
+
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    setVoiceName(window.localStorage.getItem(VOICE_KEY));
+    const load = () => setVoices(window.speechSynthesis.getVoices());
+    load();
+    window.speechSynthesis.addEventListener("voiceschanged", load);
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
+  }, []);
 
   useEffect(() => {
     setSupported(isWebSerialSupported());
@@ -82,14 +102,23 @@ function Index() {
     return () => clearInterval(t);
   }, []);
 
-  const speak = useCallback((text: string, force = false) => {
+  const speak = useCallback((text: string, force = false, isDanger = false) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel(); // never overlap; newest (state-change) message wins
     if (mutedRef.current && !force) return;
     const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.95;
+    const v = voiceRef.current;
+    if (v) u.voice = v;
+    u.lang = v?.lang ?? "en-IN";
+    u.rate = 0.9;
+    u.pitch = 0.85;
+    u.volume = 1;
+    dangerSpeaking.current = isDanger;
     u.onstart = () => setSpeaking(true);
-    u.onend = u.onerror = () => setSpeaking(false);
+    u.onend = u.onerror = () => {
+      dangerSpeaking.current = false;
+      setSpeaking(false);
+    };
     window.speechSynthesis.speak(u);
   }, []);
 
@@ -106,7 +135,7 @@ function Index() {
     prevSafety.current = safety;
     if (prev === safety) return;
     const a = announcementFor(prev, safety);
-    if (a) speak(VOICE[a]);
+    if (a) speak(VOICE[a], false, a === "DANGER");
     else if (prev === "SAFE" && typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
     if (prev === null && safety === "UNKNOWN") return;
     const [icon, label] = HISTORY_LABEL[safety];
@@ -115,16 +144,35 @@ function Index() {
     );
   }, [safety, speak, serial.distance, serial.light]);
 
+  // Light-change voice. Arduino is the source of truth; prevLight resets on
+  // connect/disconnect/demo toggle/stale data so no false transition is spoken.
+  const shownLight = stale ? null : serial.light;
+  useEffect(() => {
+    prevLight.current = null;
+  }, [serial.isConnected, demo]);
+  useEffect(() => {
+    const prev = prevLight.current;
+    prevLight.current = shownLight;
+    const a = lightAnnouncementFor(prev, shownLight);
+    if (!a || dangerSpeaking.current) return; // never cut off a danger warning
+    // On RED the safety message (clear / danger) already covers it.
+    if (a === "RED" && (safety === "SAFE" || safety === "DANGER")) return;
+    speak(LIGHT_VOICE[a]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shownLight, speak]);
+
   // Demo mode: clearly labelled, off by default
   useEffect(() => {
     if (!demo) return;
+    if (serial.isConnected) return; // Arduino is the source of truth
+    serial.reset();
     let i = 0;
     const t = setInterval(() => {
       (DEMO_STREAM[i % DEMO_STREAM.length] ?? []).forEach(serial.ingest);
       i++;
     }, 2500);
     return () => clearInterval(t);
-  }, [demo, serial.ingest]);
+  }, [demo, serial.ingest, serial.isConnected, serial.reset]);
 
   const pushTimings = useCallback(
     async (t: Timings) => {
@@ -230,9 +278,26 @@ function Index() {
                 {voiceState}
               </span>
             </div>
-            <button onClick={() => speak("BLINDWAY voice test.", true)} className="w-full rounded-lg bg-secondary px-4 py-3 font-semibold hover:bg-accent">
+            <button onClick={() => speak(LIGHT_VOICE.RED_TO_YELLOW, true)} className="w-full rounded-lg bg-secondary px-4 py-3 font-semibold hover:bg-accent">
               🔊 TEST VOICE
             </button>
+            {voices.length > 0 && (
+              <select
+                aria-label="Voice"
+                value={voiceRef.current?.name ?? ""}
+                onChange={(e) => {
+                  setVoiceName(e.target.value);
+                  window.localStorage.setItem(VOICE_KEY, e.target.value);
+                }}
+                className="w-full rounded-lg border bg-background px-3 py-2 text-sm"
+              >
+                {voices.map((v) => (
+                  <option key={v.name} value={v.name}>
+                    {v.name} ({v.lang})
+                  </option>
+                ))}
+              </select>
+            )}
             <button onClick={() => setMuted((m) => !m)} className="w-full rounded-lg border px-4 py-3 font-semibold hover:bg-accent" aria-pressed={muted}>
               {muted ? "🔇 UNMUTE" : "🔈 MUTE"}
             </button>
